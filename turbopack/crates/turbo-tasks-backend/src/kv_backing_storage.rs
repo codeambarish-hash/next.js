@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use turbo_bincode::{new_turbo_bincode_decoder, turbo_bincode_decode, turbo_bincode_encode};
 use turbo_persistence::CommitStats;
@@ -20,10 +19,7 @@ use turbo_tasks::{
 use crate::{
     GitVersionInfo,
     backend::{AnyOperation, SpecificTaskDataCategory, storage_schema::TaskStorage},
-    backing_storage::{
-        SnapshotItem, SnapshotMeta, TaskDeletion, TaskTypeHash,
-        compute_task_type_hash_from_components,
-    },
+    backing_storage::{SnapshotItem, SnapshotMeta, compute_task_type_hash_from_components},
     database::{
         db_invalidation::{StartupCacheState, check_db_invalidation_and_cleanup, invalidate_db},
         db_versioning::handle_db_versioning,
@@ -241,108 +237,81 @@ impl TurboBackingStorage {
 
         {
             let span = tracing::trace_span!("update task data");
-            let per_shard =
+            let mut snapshot_meta =
                 parallel::map_collect_owned::<_, _, Result<Vec<_>>>(snapshots, |shard: I| {
                     let _span = span.clone().entered();
                     let mut max_new_task_id = 0;
                     let mut data_items = 0;
                     let mut meta_items = 0;
                     let mut task_cache_items = 0;
-                    let mut shard_deletes: Vec<TaskDeletion> = Vec::new();
                     for item in shard {
-                        let (task_id, meta, data, task_type_hash) = match item {
+                        match item {
                             SnapshotItem::Put {
                                 task_id,
                                 meta,
                                 data,
                                 task_type_hash,
-                            } => (task_id, meta, data, task_type_hash),
-                            SnapshotItem::Delete(deletion) => {
-                                let key = IntKey::new(*deletion.task_id);
+                            } => {
+                                let key = IntKey::new(*task_id);
                                 let key = key.as_ref();
-                                // apply these deletions immediately: TaskMeta/TaskData are
-                                // SingleValue, so a key-granular delete is exact
+                                if let Some(meta) = meta {
+                                    batch.put(
+                                        KeySpace::TaskMeta,
+                                        WriteBuffer::Borrowed(key),
+                                        WriteBuffer::SmallVec(meta),
+                                    )?;
+                                    meta_items += 1;
+                                }
+                                if let Some(data) = data {
+                                    batch.put(
+                                        KeySpace::TaskData,
+                                        WriteBuffer::Borrowed(key),
+                                        WriteBuffer::SmallVec(data),
+                                    )?;
+                                    data_items += 1;
+                                }
+                                // Write task cache entry inline if this is a new task
+                                if let Some(task_type_hash) = task_type_hash {
+                                    batch.put(
+                                        KeySpace::TaskCache,
+                                        WriteBuffer::Borrowed(&task_type_hash),
+                                        WriteBuffer::Borrowed(key),
+                                    )?;
+                                    task_cache_items += 1;
+                                    max_new_task_id = max_new_task_id.max(*task_id);
+                                }
+                            }
+                            SnapshotItem::Delete {
+                                task_id,
+                                task_type_hash,
+                            } => {
+                                let key = IntKey::new(*task_id);
+                                let key = key.as_ref();
                                 batch.delete(KeySpace::TaskMeta, WriteBuffer::Borrowed(key))?;
                                 batch.delete(KeySpace::TaskData, WriteBuffer::Borrowed(key))?;
-                                // defer these until after the parallel block: the TaskCache
-                                // tombstone is a MultiValue read-modify-write
-                                shard_deletes.push(deletion);
+                                batch.delete_value(
+                                    KeySpace::TaskCache,
+                                    WriteBuffer::Borrowed(&task_type_hash),
+                                    *key.as_array().unwrap(),
+                                )?;
                                 continue;
                             }
                         };
-                        let key = IntKey::new(*task_id);
-                        let key = key.as_ref();
-                        if let Some(meta) = meta {
-                            batch.put(
-                                KeySpace::TaskMeta,
-                                WriteBuffer::Borrowed(key),
-                                WriteBuffer::SmallVec(meta),
-                            )?;
-                            meta_items += 1;
-                        }
-                        if let Some(data) = data {
-                            batch.put(
-                                KeySpace::TaskData,
-                                WriteBuffer::Borrowed(key),
-                                WriteBuffer::SmallVec(data),
-                            )?;
-                            data_items += 1;
-                        }
-                        // Write task cache entry inline if this is a new task
-                        if let Some(task_type_hash) = task_type_hash {
-                            batch.put(
-                                KeySpace::TaskCache,
-                                WriteBuffer::Borrowed(&task_type_hash),
-                                WriteBuffer::Borrowed(key),
-                            )?;
-                            task_cache_items += 1;
-                            max_new_task_id = max_new_task_id.max(*task_id);
-                        }
                     }
-                    Ok((
-                        SnapshotMeta {
-                            data_items,
-                            meta_items,
-                            task_cache_items,
-                            // The on-disk byte totals aren't known until the batch is committed
-                            // below; they're filled in from `CommitStats` after `batch.commit()`.
-                            bytes_written: 0,
-                            bytes_deleted: 0,
-                            max_next_task_id: max_new_task_id,
-                        },
-                        shard_deletes,
-                    ))
-                })?;
-            // Merge the per-shard snapshot metadata and, in the same pass, group the deleted ids by
-            // their TaskCache hash bucket (their SingleValue TaskMeta/TaskData tombstones were
-            // already applied inline in the parallel phase above). TaskCache is MultiValue and a
-            // tombstone erases the *whole* bucket, so for each distinct hash we must re-insert
-            // every id still living in that bucket (any type that xxh3-collides with a
-            // deleted one). Normally each hash maps to exactly the single id being
-            // deleted, so the survivor set is empty.
-            let mut snapshot_meta = SnapshotMeta::default();
-            let mut deleted_by_hash: FxHashMap<TaskTypeHash, SmallVec<[TaskId; 4]>> =
-                FxHashMap::default();
-            let mut deleted_count = 0usize;
-            for (meta, shard_deletes) in per_shard {
-                snapshot_meta = snapshot_meta.merge(meta);
-                for deletion in shard_deletes {
-                    deleted_by_hash
-                        .entry(deletion.task_type_hash)
-                        .or_default()
-                        .push(deletion.task_id);
-                    deleted_count += 1;
-                }
-            }
-
-            if !deleted_by_hash.is_empty() {
-                apply_task_cache_deletions(
-                    &self.inner.database,
-                    &batch,
-                    deleted_by_hash,
-                    deleted_count,
-                )?;
-            }
+                    Ok(SnapshotMeta {
+                        data_items,
+                        meta_items,
+                        task_cache_items,
+                        // The on-disk byte totals aren't known until the batch is committed
+                        // below; they're filled in from `CommitStats` after `batch.commit()`.
+                        bytes_written: 0,
+                        bytes_deleted: 0,
+                        max_next_task_id: max_new_task_id,
+                    })
+                })?
+                .into_iter()
+                .reduce(|next, prev| next.merge(prev))
+                .unwrap_or_default();
 
             let span = tracing::trace_span!("flush task data");
             parallel::try_for_each(
@@ -400,6 +369,10 @@ impl TurboBackingStorage {
         Ok(task_ids)
     }
 
+    /// Restores `category` for `task_id` into `storage`, returning whether the key was **present**
+    /// in the database. `Ok(false)` means the key is absent (nothing decoded, `storage` left
+    /// untouched) — callers that require the task to exist use this to distinguish a real (possibly
+    /// empty) on-disk task from one that was never persisted or has been tombstoned.
     pub(crate) fn lookup_data(
         &self,
         task_id: TaskId,
@@ -466,56 +439,6 @@ impl TurboBackingStorage {
     pub(crate) fn has_unrecoverable_write_error(&self) -> bool {
         self.inner.database.has_unrecoverable_write_error()
     }
-}
-
-/// Applies the `TaskCache` tombstones for GC-collected tasks, grouped by their hash bucket.
-///
-/// `TaskCache` is MultiValue and a tombstone erases the *whole* bucket, so for each distinct hash
-/// we read the authoritative on-disk bucket and re-insert every id NOT being deleted — any type
-/// that xxh3-collides with a deleted one. Normally each hash maps to exactly the single deleted id,
-/// so the survivor set is empty. (A survivor that is a *new* task added in this same commit is
-/// covered by its own put; new tasks aren't on disk yet, so they can't appear here.)
-///
-/// Runs after all puts (each bucket is a read+delete+reinsert), but the buckets are independent
-/// (distinct hash keys, sharing only the `batch`/`database` refs), so they process in parallel:
-/// `batch.delete`/`batch.put` use the same thread-local collectors the put phase does, and
-/// `get_multiple` is a shared-ref read.
-fn apply_task_cache_deletions(
-    database: &TurboKeyValueDatabase,
-    batch: &TurboWriteBatch<'_>,
-    deleted_by_hash: FxHashMap<TaskTypeHash, SmallVec<[TaskId; 4]>>,
-    deleted_count: usize,
-) -> Result<()> {
-    let span = tracing::trace_span!("delete tasks", count = deleted_count);
-    // TODO: this would be a good usecase for a batch_get_multiple, that would optimize reading
-    parallel::try_for_each_owned(
-        deleted_by_hash.into_iter().collect::<Vec<_>>(),
-        |(task_type_hash, deleted_ids)| {
-            let _span = span.clone().entered();
-            let bucket = database
-                .get_multiple(KeySpace::TaskCache, &task_type_hash)
-                .with_context(|| {
-                    format!("Reading TaskCache bucket {task_type_hash:?} for GC re-insert")
-                })?;
-            batch.delete(
-                KeySpace::TaskCache,
-                WriteBuffer::Borrowed(&task_type_hash[..]),
-            )?;
-            for bytes in bucket {
-                let id = TaskId::try_from(as_u32(bytes)?)?;
-                if deleted_ids.contains(&id) {
-                    continue;
-                }
-                let survivor_key = IntKey::new(*id);
-                batch.put(
-                    KeySpace::TaskCache,
-                    WriteBuffer::Borrowed(&task_type_hash[..]),
-                    WriteBuffer::Vec(survivor_key.as_ref().to_vec()),
-                )?;
-            }
-            anyhow::Ok(())
-        },
-    )
 }
 
 fn get_next_free_task_id(batch: &TurboWriteBatch<'_>) -> Result<u32, anyhow::Error> {
@@ -899,10 +822,10 @@ mod tests {
         // Snapshot with no task data, just the one deletion (carried inline as a delete item).
         storage.save_snapshot(
             Vec::new(),
-            vec![vec![SnapshotItem::Delete(TaskDeletion {
+            vec![vec![SnapshotItem::Delete {
                 task_id: deleted_id,
                 task_type_hash: collision_hash.to_le_bytes(),
-            })]],
+            }]],
         )?;
 
         // The deleted id is gone; the disk-only survivor was re-inserted automatically.

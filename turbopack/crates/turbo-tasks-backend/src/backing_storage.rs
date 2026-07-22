@@ -24,12 +24,10 @@ pub enum SnapshotItem {
         task_type_hash: Option<TaskTypeHash>,
     },
     /// Tombstone a GC-collected task (see [`TaskDeletion`]).
-    ///
-    /// Not yet constructed: this PR lands the persistence-side delete mechanism (the
-    /// `save_snapshot` handling below + its tests). The GC pass that emits `Delete` for
-    /// soft-deleted tasks lands in a later PR in the stack.
-    #[allow(dead_code)]
-    Delete(TaskDeletion),
+    Delete {
+        task_id: TaskId,
+        task_type_hash: TaskTypeHash,
+    },
 }
 
 impl SnapshotItem {
@@ -38,48 +36,9 @@ impl SnapshotItem {
     #[cfg(test)]
     pub fn task_id(&self) -> TaskId {
         match self {
-            SnapshotItem::Put { task_id, .. } => *task_id,
-            SnapshotItem::Delete(TaskDeletion { task_id, .. }) => *task_id,
+            SnapshotItem::Delete { task_id, .. } | SnapshotItem::Put { task_id, .. } => *task_id,
         }
     }
-}
-
-/// A GC-collected task to tombstone from persistent storage, applied in the same commit as the
-/// snapshot. See `save_snapshot` for how the tombstone is applied (the `TaskCache` bucket
-/// re-insertion of hash-colliding survivors lives there).
-///
-/// This is identity-only: the task's id and the hash of its type, with no copy of the value being
-/// deleted (neither the `TaskMeta`/`TaskData` buffers nor the full `CachedTaskType` behind the
-/// hash). That is enough for `TaskMeta` and `TaskData`, which are `SingleValue` key spaces where a
-/// key-granular delete is exact.
-///
-/// It costs us on `TaskCache`, which is `MultiValue`: a tombstone there is value-less, so it can
-/// only mean "drop the whole hash bucket". That forces `save_snapshot` to read the bucket back and
-/// re-insert every id that xxh3-collides with a deleted one, synchronously, on every GC commit.
-///
-/// The cleaner design is a *valued* tombstone: record the id being deleted alongside the key, and
-/// let the deletion stay lazy the way the rest of `turbo-persistence` already is. Nothing would
-/// need to be read at commit time — compaction drops the matching entry the next time it rewrites
-/// the key group, and reads filter it out until then. The two places that would change already
-/// inspect tombstones and already have the entry in hand: the `MultiValue` arm of the compaction
-/// merge (which today sets `skip_remaining_for_this_key` on any tombstone) and `get_impl` (which
-/// today stops at the first tombstone). Both would narrow from "skip the group" to "skip entries
-/// matching this value". Tombstones already sort last within a key group, so a filtering pass sees
-/// every value before the tombstone that kills it, and `TaskCache` values are 4-byte task ids,
-/// small enough to ride inline in the tombstone entry.
-///
-/// That is a `turbo-persistence` format change (the on-disk `Deleted` entry type carries no value
-/// bytes today, so old and new tombstones would have to coexist behind a version bump) plus a query
-/// change (reads could no longer return early at the first tombstone; they would have to accumulate
-/// tombstones across all older layers). It is out of scope here and does not change this struct's
-/// shape — `TaskDeletion` already carries exactly the identity such a tombstone needs. Until then
-/// we pay the read, which is cheap in practice: collisions are rare, so almost every bucket holds
-/// only the one id being deleted and the survivor set is empty.
-pub struct TaskDeletion {
-    pub task_id: TaskId,
-    /// The deleted task's `TaskCache` key. Always present: only persistent tasks are collected,
-    /// and those always have a task type.
-    pub task_type_hash: TaskTypeHash,
 }
 
 /// Computes a deterministic 64-bit hash of a CachedTaskType for use as a TaskCache key.

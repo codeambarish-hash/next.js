@@ -244,6 +244,18 @@ impl<'a> TurboWriteBatch<'a> {
     pub fn delete(&self, key_space: KeySpace, key: WriteBuffer<'_>) -> Result<()> {
         self.batch.delete(key_space as u32, key.into_static())
     }
+    /// Writes a delete (tombstone) for a `key` value pair into the write batch.
+    ///
+    /// This is only allowed for multivalue families.
+    pub fn delete_value(
+        &self,
+        key_space: KeySpace,
+        key: WriteBuffer<'_>,
+        value: [u8; 4],
+    ) -> Result<()> {
+        self.batch
+            .delete_value(key_space as u32, key.into_static(), value)
+    }
 
     /// Flushes a key space of the write batch, reducing the amount of buffered memory used.
     /// Does not commit any data persistently.
