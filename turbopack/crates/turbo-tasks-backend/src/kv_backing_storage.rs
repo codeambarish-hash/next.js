@@ -18,7 +18,7 @@ use turbo_tasks::{
 
 use crate::{
     GitVersionInfo,
-    backend::{AnyOperation, SpecificTaskDataCategory, storage_schema::TaskStorage},
+    backend::{AnyOperation, SpecificTaskDataCategory, TtlCounter, storage_schema::TaskStorage},
     backing_storage::{SnapshotItem, SnapshotMeta, compute_task_type_hash_from_components},
     database::{
         db_invalidation::{StartupCacheState, check_db_invalidation_and_cleanup, invalidate_db},
@@ -246,10 +246,10 @@ impl TurboBackingStorage {
     }
 
     /// Reads the persisted GC roots set (see [`InfraKey::GcRoots`]): each durable root's `TaskId`
-    /// paired with the wall-clock millis-since-epoch at which it was last observed anchored.
-    /// Empty on a fresh database.
-    pub(crate) fn roots(&self) -> Result<Vec<(TaskId, u64)>> {
-        fn get(database: &TurboKeyValueDatabase) -> Result<Vec<(TaskId, u64)>> {
+    /// paired with its [`TtlCounter`] — either "live in the most recent session" or the timestamp
+    /// at which it first went stale. Empty on a fresh database.
+    pub(crate) fn roots(&self) -> Result<Vec<(TaskId, TtlCounter)>> {
+        fn get(database: &TurboKeyValueDatabase) -> Result<Vec<(TaskId, TtlCounter)>> {
             let Some(roots) = database.get(KeySpace::Infra, InfraKey::GcRoots.key().as_ref())?
             else {
                 return Ok(Vec::new());
@@ -263,7 +263,7 @@ impl TurboBackingStorage {
     pub(crate) fn save_snapshot<I>(
         &self,
         operations: Vec<Arc<AnyOperation>>,
-        roots: Option<Vec<(TaskId, u64)>>,
+        roots: Option<Vec<(TaskId, TtlCounter)>>,
         snapshots: Vec<I>,
     ) -> Result<SnapshotMeta>
     where
@@ -491,7 +491,7 @@ fn save_infra(
     batch: &TurboWriteBatch<'_>,
     next_task_id: u32,
     operations: Vec<Arc<AnyOperation>>,
-    roots: Option<Vec<(TaskId, u64)>>,
+    roots: Option<Vec<(TaskId, TtlCounter)>>,
 ) -> Result<(), anyhow::Error> {
     batch
         .put(
