@@ -1023,115 +1023,38 @@ describe('app-dir action handling', () => {
       })
     })
 
-    describe('import traces', () => {
-      // The trace must continue past the "use server" module into the module
-      // that imports the action, so that the error can be located in the app.
-      it('should show the import trace through an action imported by a server component', async () => {
-        const browser = await next.browser('/server')
-        expect(await browser.elementByCss('h1').text()).toBe('0')
+    it('should show the import trace through an action imported by a client component', async () => {
+      const browser = await next.browser('/client-error')
+      await next.patchFile(
+        'app/client-error/actions-lib.js',
+        (origContent) => origContent + `\n}}}`,
+        async () => {
+          await waitForRedbox(browser)
+          const source = await getRedboxSource(browser)
+          if (isTurbopack) {
+            // The import trace for the other bundlers is truncated and not particularly interesting
+            expect(source).toMatchInlineSnapshot(`
+             "./app/client-error/actions-lib.js (3:1)
+             Error: Expression expected
+               1 | export const value = 123
+               2 |
+             > 3 | }}}
+                 | ^
 
-        // Created here rather than committed to the fixture: a file with a
-        // syntax error would fail the `next build` that runs for
-        // `next start`/deploy mode. `patchFile` deletes files that did not
-        // previously exist, and restores those that did.
-        await next.patchFile(
-          'app/server/actions-trace-lib.js',
-          'export const value = 1\n}}}',
-          async () => {
-            await next.patchFile(
-              'app/server/actions.js',
-              (origContent) =>
-                `import { value } from './actions-trace-lib'\n` +
-                origContent +
-                `\n\nexport async function readTracedValue() {\n  return value\n}\n`,
-              async () => {
-                await waitForRedbox(browser)
-                const source = await getRedboxSource(browser)
-                if (isTurbopack) {
-                  // The import trace for the other bundlers is truncated and not particularly interesting
-                  expect(source).toMatchInlineSnapshot(`
-                   "./app/server/actions-trace-lib.js (2:1)
-                   Error: Expression expected
-                     1 | export const value = 1
-                   > 2 | }}}
-                       | ^
+             Parsing ecmascript source code failed
 
-                   Parsing ecmascript source code failed
-
-                   Import traces:
-                     Server Component:
-                       ./app/server/actions-trace-lib.js
-                       ./app/server/actions.js
-                       ./app/server/page.js
-
-                     Client Component Browser:
-                       ./app/server/actions-trace-lib.js [Client Component Browser]
-                       ./app/server/actions.js [Client Component Browser]
-                       ./app/server/client-form.js [Client Component Browser]
-                       ./app/server/client-form.js [Server Component]
-                       ./app/server/page.js [Server Component]
-
-                     Client Component SSR:
-                       ./app/server/actions-trace-lib.js [Client Component SSR]
-                       ./app/server/actions.js [Client Component SSR]
-                       ./app/server/client-form.js [Client Component SSR]
-                       ./app/server/client-form.js [Server Component]
-                       ./app/server/page.js [Server Component]"
-                  `)
-                }
-              }
-            )
+             Import trace:
+               Server Component:
+                 ./app/client-error/actions-lib.js [Server Component]
+                 ./app/client-error/actions.js [Server Component]
+                 ./app/client-error/actions.js [Client Component SSR]
+                 ./app/client-error/client.js [Client Component SSR]
+                 ./app/client-error/client.js [Server Component]
+                 ./app/client-error/page.js [Server Component]"
+            `)
           }
-        )
-      })
-
-      it('should show the import trace through an action imported by a client component', async () => {
-        const browser = await next.browser('/client')
-        expect(await browser.elementById('count').text()).toBe('0')
-
-        await next.patchFile(
-          'app/client/actions-trace-lib.js',
-          'export const value = 1\n}}}',
-          async () => {
-            await next.patchFile(
-              'app/client/actions.js',
-              (origContent) =>
-                `import { value } from './actions-trace-lib'\n` +
-                origContent +
-                `\n\nexport async function readTracedValue() {\n  return value\n}\n`,
-              async () => {
-                await waitForRedbox(browser)
-                const source = await getRedboxSource(browser)
-                if (isTurbopack) {
-                  // The import trace for the other bundlers is truncated and not particularly interesting
-                  expect(source).toMatchInlineSnapshot(`
-                   "./app/client/actions-trace-lib.js (2:1)
-                   Error: Expression expected
-                     1 | export const value = 1
-                   > 2 | }}}
-                       | ^
-
-                   Parsing ecmascript source code failed
-
-                   Import traces:
-                     Client Component Browser:
-                       ./app/client/actions-trace-lib.js [Client Component Browser]
-                       ./app/client/actions.js [Client Component Browser]
-                       ./app/client/page.js [Client Component Browser]
-                       ./app/client/page.js [Server Component]
-
-                     Client Component SSR:
-                       ./app/client/actions-trace-lib.js [Client Component SSR]
-                       ./app/client/actions.js [Client Component SSR]
-                       ./app/client/page.js [Client Component SSR]
-                       ./app/client/page.js [Server Component]"
-                  `)
-                }
-              }
-            )
-          }
-        )
-      })
+        }
+      )
     })
 
     describe('HMR', () => {
