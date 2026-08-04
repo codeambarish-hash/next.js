@@ -1003,27 +1003,134 @@ describe('app-dir action handling', () => {
     describe('"use server" export values', () => {
       it('should error when exporting non async functions at build time', async () => {
         const filePath = 'app/server/actions.js'
-        const origContent = await next.readFile(filePath)
 
-        try {
-          const browser = await next.browser('/server')
+        const browser = await next.browser('/server')
 
-          const cnt = await browser.elementByCss('h1').text()
-          expect(cnt).toBe('0')
+        const cnt = await browser.elementByCss('h1').text()
+        expect(cnt).toBe('0')
 
+        await next.patchFile(
+          filePath,
           // This can be caught by SWC directly
-          await next.patchFile(
-            filePath,
-            origContent + '\n\nexport const foo = 1'
-          )
+          (origContent) => origContent + '\n\nexport const foo = 1',
+          async () => {
+            await waitForRedbox(browser)
+            expect(await getRedboxSource(browser)).toContain(
+              'Only async functions are allowed to be exported in a "use server" file.'
+            )
+          }
+        )
+      })
+    })
 
-          await waitForRedbox(browser)
-          expect(await getRedboxSource(browser)).toContain(
-            'Only async functions are allowed to be exported in a "use server" file.'
-          )
-        } finally {
-          await next.patchFile(filePath, origContent)
-        }
+    describe('import traces', () => {
+      // The trace must continue past the "use server" module into the module
+      // that imports the action, so that the error can be located in the app.
+      it('should show the import trace through an action imported by a server component', async () => {
+        const browser = await next.browser('/server')
+        expect(await browser.elementByCss('h1').text()).toBe('0')
+
+        // Created here rather than committed to the fixture: a file with a
+        // syntax error would fail the `next build` that runs for
+        // `next start`/deploy mode. `patchFile` deletes files that did not
+        // previously exist, and restores those that did.
+        await next.patchFile(
+          'app/server/actions-trace-lib.js',
+          'export const value = 1\n}}}',
+          async () => {
+            await next.patchFile(
+              'app/server/actions.js',
+              (origContent) =>
+                `import { value } from './actions-trace-lib'\n` +
+                origContent +
+                `\n\nexport async function readTracedValue() {\n  return value\n}\n`,
+              async () => {
+                await waitForRedbox(browser)
+                const source = await getRedboxSource(browser)
+                if (isTurbopack) {
+                  // The import trace for the other bundlers is truncated and not particularly interesting
+                  expect(source).toMatchInlineSnapshot(`
+                   "./app/server/actions-trace-lib.js (2:1)
+                   Error: Expression expected
+                     1 | export const value = 1
+                   > 2 | }}}
+                       | ^
+
+                   Parsing ecmascript source code failed
+
+                   Import traces:
+                     Server Component:
+                       ./app/server/actions-trace-lib.js
+                       ./app/server/actions.js
+                       ./app/server/page.js
+
+                     Client Component Browser:
+                       ./app/server/actions-trace-lib.js [Client Component Browser]
+                       ./app/server/actions.js [Client Component Browser]
+                       ./app/server/client-form.js [Client Component Browser]
+                       ./app/server/client-form.js [Server Component]
+                       ./app/server/page.js [Server Component]
+
+                     Client Component SSR:
+                       ./app/server/actions-trace-lib.js [Client Component SSR]
+                       ./app/server/actions.js [Client Component SSR]
+                       ./app/server/client-form.js [Client Component SSR]
+                       ./app/server/client-form.js [Server Component]
+                       ./app/server/page.js [Server Component]"
+                  `)
+                }
+              }
+            )
+          }
+        )
+      })
+
+      it('should show the import trace through an action imported by a client component', async () => {
+        const browser = await next.browser('/client')
+        expect(await browser.elementById('count').text()).toBe('0')
+
+        await next.patchFile(
+          'app/client/actions-trace-lib.js',
+          'export const value = 1\n}}}',
+          async () => {
+            await next.patchFile(
+              'app/client/actions.js',
+              (origContent) =>
+                `import { value } from './actions-trace-lib'\n` +
+                origContent +
+                `\n\nexport async function readTracedValue() {\n  return value\n}\n`,
+              async () => {
+                await waitForRedbox(browser)
+                const source = await getRedboxSource(browser)
+                if (isTurbopack) {
+                  // The import trace for the other bundlers is truncated and not particularly interesting
+                  expect(source).toMatchInlineSnapshot(`
+                   "./app/client/actions-trace-lib.js (2:1)
+                   Error: Expression expected
+                     1 | export const value = 1
+                   > 2 | }}}
+                       | ^
+
+                   Parsing ecmascript source code failed
+
+                   Import traces:
+                     Client Component Browser:
+                       ./app/client/actions-trace-lib.js [Client Component Browser]
+                       ./app/client/actions.js [Client Component Browser]
+                       ./app/client/page.js [Client Component Browser]
+                       ./app/client/page.js [Server Component]
+
+                     Client Component SSR:
+                       ./app/client/actions-trace-lib.js [Client Component SSR]
+                       ./app/client/actions.js [Client Component SSR]
+                       ./app/client/page.js [Client Component SSR]
+                       ./app/client/page.js [Server Component]"
+                  `)
+                }
+              }
+            )
+          }
+        )
       })
     })
 
