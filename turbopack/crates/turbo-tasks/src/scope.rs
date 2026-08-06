@@ -269,23 +269,20 @@ where
 // Unbounded scope
 // ---------------------------------------------------------------------------
 //
-// Unlike `scope_and_block` (a fixed job set, terminated by an `End` sentinel), a running job here
-// may enqueue more work, so the total is unknown up front. Termination is driven by the
-// `remaining_tasks` counter reaching zero. The counter/parking/panic handling mirror `ScopeInner`.
+// A running job may enqueue more work, so the total is unknown up front. Termination is driven by
+// the `remaining_tasks` counter reaching zero.
 
-/// A reference to the shared per-item closure for a [`scope_unbounded`] run. Borrowed (not boxed) —
-/// the closure lives on `scope_unbounded`'s stack frame, which outlives every drainer. `'run` is
-/// the lifetime of the borrows it captures (`'env` at the call site, erased to `'static` for
-/// storage in [`UnboundedInner`]).
+/// A reference to the shared per-item closure for a [`scope_unbounded`] run. `'run` is the lifetime
+/// of the borrows it captures (`'env` at the call site, erased to `'static` for storage in
+/// [`UnboundedInner`]).
 type RunFn<'run, T> = &'run (dyn Fn(&Spawner<'_, T>, T) -> ControlFlow<()> + Send + Sync + 'run);
 
-/// Shared state for a [`scope_unbounded`] run. Holds raw `T` items (not boxed closures) — the only
-/// `'env`-borrowing thing is the shared `run`, whose borrows are erased once here rather than once
-/// per item. Requires `T: 'static`, which the queue payload must satisfy anyway.
+/// Shared state for a [`scope_unbounded`] run. The only `'env`-borrowing thing is the shared `run`,
+/// whose borrows are erased once here rather than once per item.
 struct UnboundedInner<T: Send + 'static> {
     main_thread: Thread,
     /// Items enqueued but not yet finished. The scope is done exactly when this reaches zero; see
-    /// [`Spawner::spawn`] for the increment-before-finish ordering that makes zero reliable.
+    /// [`enqueue`] for the increment-before-finish ordering that makes zero reliable.
     remaining_tasks: AtomicUsize,
     /// First panic raised while processing an item; propagated to the caller after the join.
     panic: Mutex<Option<Box<dyn Any + Send + 'static>>>,
@@ -293,8 +290,6 @@ struct UnboundedInner<T: Send + 'static> {
     work_queue: Receiver<T>,
     /// Sending end. This is the *only* sender — drainers never hold a clone, because a clone
     /// parked in `recv` would keep the channel open and deadlock the close.
-    /// [`UnboundedInner::abort`] takes it to close the channel; the `Joiner` takes it on the
-    /// normal path.
     work_queue_sender: Mutex<Option<Sender<T>>>,
     /// Set by [`UnboundedInner::abort`] when a `run` returns [`ControlFlow::Break`]. Latches: once
     /// set, [`Spawner::spawn`] drops further items and drainers discard what is still buffered, so
@@ -305,16 +300,13 @@ struct UnboundedInner<T: Send + 'static> {
     /// before it touches `remaining_tasks`.
     aborted: AtomicBool,
     /// Reference to the per-item closure (with turbo-tasks context re-established), shared by
-    /// every drainer. It lives on `scope_unbounded`'s stack; its `'env` borrows are erased to
-    /// `'static` here, and the `Joiner` guarantees every drainer finishes before `'env` ends
-    /// (and before the closure's stack frame is popped). See `scope_unbounded` for the safety
-    /// argument.
+    /// every drainer. It lives on `scope_unbounded`'s stack, with its `'env` borrows erased to
+    /// `'static` here; see the `SAFETY` comment there.
     run: RunFn<'static, T>,
 }
 
 impl<T: Send + 'static> UnboundedInner<T> {
-    /// Counts a newly-enqueued item. MUST run before the push, and — for a child spawned inside
-    /// `run` — before the parent finishes; see [`Spawner::spawn`].
+    /// Counts a newly-enqueued item. MUST run before the push; see [`enqueue`].
     #[inline]
     fn account_new_item(&self) {
         self.remaining_tasks.fetch_add(1, Ordering::Relaxed);
@@ -329,17 +321,12 @@ impl<T: Send + 'static> UnboundedInner<T> {
         self.main_thread.unpark();
     }
 
-    /// Abandons all queued-but-unstarted work: latches `aborted` and closes the queue so no further
-    /// item can be enqueued.
+    /// Abandons all queued-but-unstarted work: latches `aborted` and closes the queue. Items
+    /// already being processed on other threads are **not** interrupted; they run to completion.
     ///
-    /// Closing is what makes the wind-down terminate. Items still buffered in the channel are
-    /// *not* discarded by the close — they are still delivered — but [`UnboundedInner::drain`]
-    /// sees `aborted` and discards each without running it, and because a discarded item never
-    /// reaches `run` it can never spawn a successor. The buffer therefore drains monotonically to
-    /// empty instead of being re-grown by jobs that are still finishing.
-    ///
-    /// Items already being processed on other threads are **not** interrupted; they run to
-    /// completion. Only unstarted work is discarded.
+    /// Buffered items are still delivered after the close, but [`UnboundedInner::drain`] sees
+    /// `aborted` and discards each without running it. Since only `run` can spawn a successor, the
+    /// buffer drains monotonically to empty instead of being re-grown by jobs still finishing.
     ///
     /// `aborted` is stored before the close so a `spawn` racing this either lands while the channel
     /// is open (and is discarded later by `drain`) or observes the flag and never counts its item —
@@ -380,8 +367,7 @@ impl<T: Send + 'static> UnboundedInner<T> {
         // sender still alive) while it runs alone, with no work to steal. Consider a timeout/steal
         // strategy if that becomes a problem in practice.
         while let Ok(item) = self.work_queue.recv() {
-            // Post-abort: discard without running. Skipping `run` is what stops the wind-down from
-            // re-growing the queue, since only `run` can spawn a successor.
+            // Post-abort: discard without running, so the wind-down can't re-grow the queue.
             if self.aborted.load(Ordering::Acquire) {
                 self.on_item_finished(None);
                 continue;
@@ -449,10 +435,8 @@ impl<T: Send + 'static> Spawner<'_, T> {
     ///
     /// **After any `run` has returned [`ControlFlow::Break`], this silently drops `item`.** The
     /// scope is winding down and the queue is closed; re-filling it from jobs that are still
-    /// finishing would defeat the abort. Callers that abort must therefore treat
-    /// unspawned work as abandoned — for a work-list that can be recomputed (like GC's, where
-    /// collectibility is re-derived from durable state each pass) that is exactly the desired
-    /// behaviour.
+    /// finishing would defeat the abort. Callers that abort must treat unspawned work as
+    /// abandoned.
     pub fn spawn(&self, item: T) {
         enqueue(self.inner, item);
     }
@@ -464,16 +448,13 @@ impl<T: Send + 'static> Spawner<'_, T> {
 /// every item (initial + transitively spawned) is done. Pushing first would let a worker pop and
 /// finish the child before the increment, corrupting the count.
 fn enqueue<T: Send + 'static>(inner: &UnboundedInner<T>, item: T) {
-    // Once aborted, nothing will ever run this item and re-growing the queue would fight the
-    // wind-down. Checking before the increment keeps the common post-abort case free of accounting.
     if inner.aborted.load(Ordering::Acquire) {
         return;
     }
     inner.account_new_item();
     // Take the send lock before testing the sender: `close` takes the sender under the same lock,
-    // so either we get a live sender and our item is buffered (and later discarded by `drain` if an
-    // abort has landed), or the sender is already gone. Either way the item cannot be counted and
-    // then stranded with nobody to drain it.
+    // so either we get a live sender and our item is buffered, or the sender is already gone.
+    // Either way the item cannot be counted and then stranded with nobody to drain it.
     let sent = {
         let sender = inner.work_queue_sender.lock();
         match sender.as_ref() {
@@ -494,28 +475,24 @@ fn enqueue<T: Send + 'static>(inner: &UnboundedInner<T>, item: T) {
 /// state captured in `run`.
 ///
 /// `run` is shared across the calling thread and up to `runtime workers - 1` helper tasks and may
-/// run concurrently. Liveness matches `scope_and_block`: the calling thread drains the whole
-/// (growing) queue itself if no helper is scheduled, so it never deadlocks on a thread-limited
-/// runtime. Prefer calling from `spawn_blocking` when other work shares the task. The first panic
-/// from any `run` is propagated after the join.
+/// run concurrently. The calling thread drains the whole (growing) queue itself if no helper is
+/// scheduled, so it never deadlocks on a thread-limited runtime. Prefer calling from
+/// `spawn_blocking` when other work shares the task. The first panic from any `run` is propagated
+/// after the join.
 ///
 /// Items must be `'static` (they sit in a queue drained by helper threads); the `run` closure may
 /// borrow `'env` data.
 ///
 /// # Aborting
 ///
-/// Returning [`ControlFlow::Break`] from `run` abandons all queued-but-unstarted items: the queue
-/// is closed and [`Spawner::spawn`] becomes a no-op, so the scope returns as soon as the
-/// currently-running jobs finish. Items still buffered are discarded without being run rather than
-/// dispatched, so they cannot spawn successors. Jobs already in flight on other threads are **not**
-/// interrupted — they run to completion. Use this when the remaining work is discardable (it can be
+/// Returning [`ControlFlow::Break`] from `run` abandons all queued-but-unstarted items, so the
+/// scope returns as soon as the currently-running jobs finish. Jobs already in flight on other
+/// threads are **not** interrupted. Use this when the remaining work is discardable (it can be
 /// recomputed on a later run) and finishing it is not worth the latency.
 ///
-/// TODO: Currently this spawns all workers who process the queue until all work is complete.  This
-/// means all workers are occupied for the whole call duration.  If this proves to be problematic we
-/// can adjust this to allow workers to time out if there is not enough work, and to spawn more if
-/// new work is produced.  This could be useful if work is bursty, a small number of items turn into
-/// a large number that turns into a long tail that turns into another large number of tasks.
+/// TODO: this occupies every worker for the whole call duration. If that proves problematic, let
+/// workers time out when there is not enough work and spawn more when new work is produced — worth
+/// doing if work turns out to be bursty.
 pub fn scope_unbounded<'env, T, F>(initial: impl IntoIterator<Item = T>, run: F)
 where
     T: Send + 'static,
@@ -537,17 +514,12 @@ where
         }
     };
 
-    // The items are `'static`, so the ONLY thing borrowing `'env` is `run`. `wrapped_run` lives on
-    // this stack frame, which outlives every drainer (the `Joiner` below joins them all before this
-    // function returns, i.e. before the frame is popped), so we hand out a *borrowed* reference to
-    // it — no allocation — and erase its `'env` borrows to `'static` for storage in `Inner` (and
-    // the `Arc` clones the helper tasks hold). This is `Scope::spawn`'s `'env`->`'static`
-    // transmute, applied once to a reference to the single shared `run`.
+    // The items are `'static`, so the ONLY thing borrowing `'env` is `run`. We hand out a borrowed
+    // reference to `wrapped_run` — no allocation — and erase its `'env` borrows to `'static` for
+    // storage in `UnboundedInner`.
     let run: RunFn<'_, T> = &wrapped_run;
-    // SAFETY: the `Joiner` below joins every drainer (via the `remaining_tasks` counter, which only
-    // reaches zero after the last `run` call has returned) before this function returns — i.e.
-    // before `'env` ends and before `wrapped_run`'s stack frame is popped. So no drainer can invoke
-    // `run` after either the erased `'env` borrows or the referent `wrapped_run` become invalid.
+    // SAFETY: the `Joiner` below joins every drainer before this function returns, i.e. before
+    // `'env` ends and before `wrapped_run`'s stack frame is popped.
     let run: RunFn<'static, T> =
         unsafe { std::mem::transmute::<RunFn<'_, T>, RunFn<'static, T>>(run) };
 
@@ -563,9 +535,8 @@ where
     });
 
     // Drop guard that unconditionally drains-and-joins before returning (or before a panic
-    // escapes), mirroring `Scope::drop`. This is what makes the `'env`->`'static` erasure of
-    // `run` sound: every drainer has finished (releasing `run`'s `'env` borrows) before `'env`
-    // ends. It also makes the calling thread drain the whole queue itself, so liveness never
+    // escapes), mirroring `Scope::drop`. This is what makes the `'env`->`'static` erasure of `run`
+    // sound. It also makes the calling thread drain the whole queue itself, so liveness never
     // depends on a helper being scheduled — even on the panic path.
     struct Joiner<T: Send + 'static> {
         inner: Arc<UnboundedInner<T>>,
@@ -599,9 +570,6 @@ where
         helper_handles,
     };
 
-    // Fill the initial items. A panic here (from `initial`'s iterator) unwinds into `joiner`'s
-    // Drop, which drains and joins before the panic propagates.
-    //
     // Count the seeding loop itself as one outstanding item. Helpers are already draining, so
     // without this `remaining_tasks` could transiently hit zero between two seeds, close the queue,
     // and leave every remaining seed silently dropped.
@@ -836,11 +804,9 @@ mod tests {
     // scope_unbounded tests
     // -----------------------------------------------------------------------
 
-    /// On a `current_thread` runtime there are no helper worker threads (`num_workers()` == 1 =>
-    /// `worker_tasks` == 0) and `block_in_place` is disallowed. The calling thread must drain the
-    /// entire queue — including everything spawned mid-run — inline, reaching termination before
-    /// `wait()` would ever call `block_in_place`. This proves the "drains inline with zero helpers"
-    /// property for the unbounded variant.
+    /// On a `current_thread` runtime there are no helpers and `block_in_place` is disallowed, so
+    /// the calling thread must drain the entire queue — including everything spawned mid-run —
+    /// inline, reaching termination before `wait()` would ever call `block_in_place`.
     #[tokio::test(flavor = "current_thread")]
     async fn test_unbounded_current_thread_runtime() {
         let processed = Arc::new(AtomicUsize::new(0));
@@ -862,8 +828,7 @@ mod tests {
     }
 
     /// On a multi-thread runtime, work spawned from inside `run` must be picked up and processed —
-    /// including by helper worker tasks. We seed a single item that fans out to a fixed number of
-    /// children and assert every item runs exactly once.
+    /// including by helper worker tasks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_unbounded_multi_thread() {
         const CHILDREN: usize = 1000;
@@ -887,16 +852,15 @@ mod tests {
         assert_eq!(processed.load(Ordering::SeqCst), 1 + CHILDREN);
     }
 
-    /// Jobs spawn a *tree* of children (each node up to a depth/branching bound). Every node must
-    /// be processed exactly once. We track visited node ids to assert both completeness (all
-    /// expected nodes seen) and exactly-once (no duplicates).
+    /// Jobs spawn a *tree* of children. Every node must be processed exactly once — the visited
+    /// flags catch both missing and duplicate visits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_unbounded_tree() {
         // Binary tree of depth 10 => 2^11 - 1 = 2047 nodes, ids 1..=2047 (heap numbering).
         const DEPTH: u32 = 10;
         const MAX_ID: usize = (1 << (DEPTH + 1)) - 1;
 
-        // One flag per possible node id; set on visit. Detects both "missing" and "double" visits.
+        // One flag per possible node id; set on visit.
         let visited: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
             (0..=MAX_ID)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -908,7 +872,6 @@ mod tests {
         let count_clone = count.clone();
         tokio::task::spawn_blocking(move || {
             scope_unbounded(std::iter::once(1usize), move |spawner, id| {
-                // Mark visited; must not have been visited before.
                 let was = visited_clone[id].swap(true, Ordering::SeqCst);
                 assert!(!was, "node {id} visited more than once");
                 count_clone.fetch_add(1, Ordering::SeqCst);
@@ -927,7 +890,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Completeness: every id 1..=MAX_ID visited exactly once.
         assert_eq!(count.load(Ordering::SeqCst), MAX_ID);
         for id in 1..=MAX_ID {
             assert!(
@@ -978,10 +940,9 @@ mod tests {
         );
     }
 
-    /// The accounting test that matters: aborting in the middle of a deep, still-growing cascade
-    /// must terminate rather than hang. `remaining_tasks` reaching zero is the sole termination
-    /// condition, and `abort` discharges a whole batch of it at once while other drainers are
-    /// concurrently spawning — the race this pins down. A hang here fails as a test timeout.
+    /// Aborting in the middle of a deep, still-growing cascade must terminate rather than hang:
+    /// `abort` discharges a whole batch of `remaining_tasks` at once while other drainers are
+    /// concurrently spawning. A hang here fails as a test timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_unbounded_abort_during_cascade() {
         // Each item spawns two children until the id exceeds the bound, so the queue is still
@@ -1014,14 +975,10 @@ mod tests {
         );
     }
 
-    /// `spawn` issued *after* the abort has latched is dropped, not enqueued. This is the case a
-    /// job finishing concurrently with another job's abort hits. If such a `spawn` still counted an
+    /// `spawn` issued *after* the abort has latched is dropped, not enqueued — the case a job
+    /// finishing concurrently with another job's abort hits. If such a `spawn` still counted an
     /// item into `remaining_tasks` without queueing it, the scope would never reach zero and this
     /// would hang rather than fail.
-    ///
-    /// The first item aborts (a `Break` return latches it), and every *later* item — there is at
-    /// most one in flight, but the seeds guarantee at least a second dispatch attempt — spawns into
-    /// the aborted scope.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_unbounded_spawn_after_abort_is_dropped() {
         let processed = Arc::new(AtomicUsize::new(0));
@@ -1069,12 +1026,9 @@ mod tests {
         assert_eq!(processed.load(Ordering::SeqCst), 1);
     }
 
-    /// A panic that happens while the scope is aborting still propagates: the `panic` slot is
-    /// independent of `aborted`, and the `Joiner` drains/joins before re-raising.
-    ///
-    /// The seed panics *and* the scope aborts (from a sibling item), so the abort's queue-clear
-    /// races the panic's unwind through `catch_unwind` -> `on_item_finished`. The panic must still
-    /// reach the caller rather than being swallowed by the wind-down.
+    /// A panic that happens while the scope is aborting still propagates rather than being
+    /// swallowed by the wind-down: the abort's queue-clear races the panic's unwind through
+    /// `catch_unwind` -> `on_item_finished`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_unbounded_abort_then_panic() {
         let result = catch_unwind(AssertUnwindSafe(|| {
