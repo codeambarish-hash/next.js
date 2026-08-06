@@ -403,8 +403,8 @@ impl TurboTasksBackend {
             // children's `parent_count` decremented, so the graph the snapshot sees is consistent.
             // Never check the budget between `set_deleted` and `CleanupOldEdges`.
             //
-            // `Break` clears the remaining queue in one shot rather than dispatching each abandoned
-            // job just to return, and stops in-flight jobs from re-growing it as they finish.
+            // `Break` closes the queue: remaining jobs are discarded without being dispatched, and
+            // in-flight jobs cannot re-grow it as they finish.
             if budget.should_stop() {
                 abandoned.fetch_add(1, Ordering::Relaxed);
                 return ControlFlow::Break(());
