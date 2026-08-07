@@ -77,6 +77,7 @@ export interface RequestStore extends CommonWorkUnitStore {
   stagedRendering?: StagedRenderingController | null
   asyncApiPromises?: AsyncApiPromises
   needsSessionShell?: boolean // DEV-only
+  hasIncompatibleShellStages?: boolean // DEV-only, mutable
   cacheSignal?: CacheSignal | null
   fallbackParams?: OpaqueFallbackRouteParams | null
   varyParamsAccumulator?: ResponseVaryParamsAccumulator | null

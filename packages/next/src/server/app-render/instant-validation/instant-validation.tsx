@@ -169,7 +169,7 @@ function stringifySegment(segment: Segment): SegmentPath {
 export type SegmentStage =
   | RenderStage.Static
   | RenderStage.ShellRuntime
-  | RenderStage.Runtime
+  | RenderStage.PrefetchRuntime
   | RenderStage.Dynamic
 
 /** The stages that a prefetched segment can be in. */
@@ -206,11 +206,11 @@ export async function collectStagedSegmentData(
   let partialStages: SegmentStage[]
   switch (prefetchKind) {
     case ValidationPrefetchKind.Shell: {
-      partialStages = [RenderStage.ShellRuntime, RenderStage.Runtime]
+      partialStages = [RenderStage.ShellRuntime, RenderStage.PrefetchRuntime]
       break
     }
     case ValidationPrefetchKind.LegacySpeculative: {
-      partialStages = [RenderStage.Static, RenderStage.Runtime]
+      partialStages = [RenderStage.Static, RenderStage.PrefetchRuntime]
       break
     }
   }
@@ -281,7 +281,7 @@ async function collectSegmentDataForStage(
       case RenderStage.Static:
         return 'Prerender'
       case RenderStage.ShellRuntime: // TODO(app-shells) - proper environmentName
-      case RenderStage.Runtime:
+      case RenderStage.PrefetchRuntime:
         return 'Prefetch'
       case RenderStage.Dynamic:
         return 'Server'
@@ -788,7 +788,7 @@ function createSegmentCacheItem(): SegmentCacheItem {
   return {
     [RenderStage.Static]: null,
     [RenderStage.ShellRuntime]: null,
-    [RenderStage.Runtime]: null,
+    [RenderStage.PrefetchRuntime]: null,
     [RenderStage.Dynamic]: null,
   }
 }
@@ -1306,7 +1306,7 @@ export async function createCombinedPayloadAtDepth(
     switch (prefetchKind) {
       case ValidationPrefetchKind.Shell: {
         if (useRuntimeStageForPartialSegments) {
-          stage = RenderStage.Runtime
+          stage = RenderStage.PrefetchRuntime
         } else {
           stage = RenderStage.ShellRuntime
         }
@@ -1316,7 +1316,7 @@ export async function createCombinedPayloadAtDepth(
       }
       case ValidationPrefetchKind.LegacySpeculative: {
         if (useRuntimeStageForPartialSegments) {
-          stage = RenderStage.Runtime
+          stage = RenderStage.PrefetchRuntime
         } else {
           // In legacy speculative prefetches, we always use static.
           stage = RenderStage.Static
@@ -1333,7 +1333,7 @@ export async function createCombinedPayloadAtDepth(
       case RenderStage.ShellRuntime: {
         break
       }
-      case RenderStage.Runtime: {
+      case RenderStage.PrefetchRuntime: {
         hasRuntimeSegments = true
         break
       }
@@ -1453,14 +1453,16 @@ export async function createCombinedPayloadAtDepth(
   switch (prefetchKind) {
     case ValidationPrefetchKind.Shell: {
       if (useRuntimeStageForPartialSegments) {
-        headStage = RenderStage.Runtime
+        headStage = RenderStage.PrefetchRuntime
       } else {
         headStage = RenderStage.ShellRuntime
       }
       break
     }
     case ValidationPrefetchKind.LegacySpeculative: {
-      headStage = hasRuntimeSegments ? RenderStage.Runtime : RenderStage.Static
+      headStage = hasRuntimeSegments
+        ? RenderStage.PrefetchRuntime
+        : RenderStage.Static
       break
     }
   }
