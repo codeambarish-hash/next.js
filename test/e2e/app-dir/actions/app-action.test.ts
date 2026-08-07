@@ -917,7 +917,12 @@ describe('app-dir action handling', () => {
       const cliOutputIndex = next.cliOutput.length
       const browser = await next.browser(`/delayed-action/${runtime}`)
       const actionRequestPaths: string[] = []
-      let actionRequestHeaders: Record<string, string> | undefined
+      let actionRequest:
+        | {
+            headers: Record<string, string>
+            body: string | null
+          }
+        | undefined
 
       browser.on('request', (request) => {
         const headers = request.headers()
@@ -926,7 +931,10 @@ describe('app-dir action handling', () => {
           headers['next-action'] !== undefined
         ) {
           actionRequestPaths.push(new URL(request.url()).pathname)
-          actionRequestHeaders = headers
+          actionRequest = {
+            headers,
+            body: request.postData(),
+          }
         }
       })
 
@@ -958,13 +966,38 @@ describe('app-dir action handling', () => {
       expect(await browser.hasElementByCssSelector('#other-page')).toBe(true)
 
       expect(actionRequestPaths).toEqual([`/delayed-action/${runtime}`])
-      expect(actionRequestHeaders?.['next-action-only']).toBeUndefined()
-      expect(actionRequestHeaders?.['next-router-state-tree']).toBeUndefined()
+      expect(actionRequest?.headers['next-action-only']).toBeUndefined()
+      expect(actionRequest?.headers['next-router-state-tree']).toBeUndefined()
 
       // make sure we didn't get any errors in the console
       expect(next.cliOutput.slice(cliOutputIndex)).not.toContain(
         'Failed to find Server Action'
       )
+
+      if (actionRequest === undefined) {
+        throw new Error('Failed to capture Server Action request')
+      }
+
+      // A valid action sent to the wrong route must fail instead of being
+      // forwarded to a route that bundles it.
+      const wronglyRoutedResponse = await next.fetch(
+        `/delayed-action/${runtime}/other`,
+        {
+          method: 'POST',
+          headers: {
+            accept: actionRequest.headers.accept,
+            'content-type': actionRequest.headers['content-type'],
+            'next-action': actionRequest.headers['next-action'],
+            origin: next.url,
+          },
+          body: actionRequest.body,
+        }
+      )
+
+      expect(wronglyRoutedResponse.status).toBe(404)
+      expect(
+        wronglyRoutedResponse.headers.get('x-nextjs-action-not-found')
+      ).toBe('1')
     }
   )
 
