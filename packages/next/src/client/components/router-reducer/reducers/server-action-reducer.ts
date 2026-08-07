@@ -70,6 +70,7 @@ import {
   invalidateBfCache,
   UnknownDynamicStaleTime,
 } from '../../segment-cache/bfcache'
+import { registerServerActionDispatchContext } from '../../../server-action-dispatch'
 
 const createFromFetch =
   createFromFetchBrowser as (typeof import('react-server-dom-webpack/client.browser'))['createFromFetch']
@@ -98,6 +99,7 @@ type FetchServerActionResult = {
    */
   actionFlightData: PartialTransportData | string | undefined
   actionFlightDataRenderedSearch: NormalizedSearch | undefined
+  actionRoutingKeys: readonly string[] | undefined
   isPrerender: boolean
   couldBeIntercepted: boolean
 }
@@ -107,7 +109,17 @@ async function fetchServerAction(
   nextUrl: ReadonlyReducerState['nextUrl'],
   action: ServerActionAction
 ): Promise<FetchServerActionResult> {
-  const { actionId, actionArgs } = action
+  const { actionId, actionArgs, actionDispatchContext } = action
+  const currentRequestUrl = new URL(state.canonicalUrl, window.location.origin)
+  const actionRequestUrl = new URL(
+    actionDispatchContext.url,
+    window.location.origin
+  )
+  const actionNextUrl = actionDispatchContext.nextUrl
+  const isCrossRouteDispatch =
+    actionRequestUrl.pathname !== currentRequestUrl.pathname ||
+    actionRequestUrl.search !== currentRequestUrl.search ||
+    actionNextUrl !== nextUrl
   const temporaryReferences = createTemporaryReferenceSet()
   const info = extractInfoFromServerReferenceId(actionId)
   const usedArgs = omitUnusedArgs(actionArgs, info)
@@ -116,9 +128,12 @@ async function fetchServerAction(
   const headers: Record<string, string> = {
     Accept: RSC_CONTENT_TYPE_HEADER,
     [ACTION_HEADER]: actionId,
-    [NEXT_ROUTER_STATE_TREE_HEADER]: prepareFlightRouterStateForRequest(
+  }
+
+  if (!isCrossRouteDispatch) {
+    headers[NEXT_ROUTER_STATE_TREE_HEADER] = prepareFlightRouterStateForRequest(
       state.tree
-    ),
+    )
   }
 
   const deploymentId = getDeploymentId()
@@ -126,8 +141,8 @@ async function fetchServerAction(
     headers['x-deployment-id'] = deploymentId
   }
 
-  if (nextUrl) {
-    headers[NEXT_URL] = nextUrl
+  if (actionNextUrl) {
+    headers[NEXT_URL] = actionNextUrl
   }
 
   if (process.env.__NEXT_DEV_SERVER) {
@@ -145,7 +160,11 @@ async function fetchServerAction(
 
   let res: Response
   try {
-    res = await fetch(state.canonicalUrl, { method: 'POST', headers, body })
+    res = await fetch(createHrefFromUrl(actionRequestUrl), {
+      method: 'POST',
+      headers,
+      body,
+    })
     // If the fetch succeeds while we're in the offline state, notify the
     // offline module so it can short-circuit the polling loop.
     if (process.env.__NEXT_USE_OFFLINE) {
@@ -238,6 +257,7 @@ async function fetchServerAction(
   let actionResult: FetchServerActionResult['actionResult']
   let actionFlightData: FetchServerActionResult['actionFlightData']
   let actionFlightDataRenderedSearch: FetchServerActionResult['actionFlightDataRenderedSearch']
+  let actionRoutingKeys: FetchServerActionResult['actionRoutingKeys']
   let couldBeIntercepted: boolean = false
 
   if (isRscResponse) {
@@ -261,6 +281,7 @@ async function fetchServerAction(
     // An internal redirect can send an RSC response, but does not have a useful `actionResult`.
     actionResult = redirectLocation ? undefined : response.a
     couldBeIntercepted = response.i
+    actionRoutingKeys = response.A
 
     // Check if the response build ID matches the client build ID.
     // In a multi-zone setup, when a server action triggers a redirect,
@@ -293,12 +314,14 @@ async function fetchServerAction(
     actionResult = undefined
     actionFlightData = undefined
     actionFlightDataRenderedSearch = undefined
+    actionRoutingKeys = undefined
   }
 
   return {
     actionResult,
     actionFlightData,
     actionFlightDataRenderedSearch,
+    actionRoutingKeys,
     redirectLocation,
     redirectType,
     revalidationKind,
@@ -338,6 +361,7 @@ export function serverActionReducer(
       actionResult,
       actionFlightData: flightData,
       actionFlightDataRenderedSearch: flightDataRenderedSearch,
+      actionRoutingKeys,
       redirectLocation,
       redirectType,
       isPrerender,
@@ -472,6 +496,11 @@ export function serverActionReducer(
         // new fetch, like we would for a normal navigation.
         const redirectCanonicalUrl = createHrefFromUrl(redirectUrl)
         const now = Date.now()
+        registerServerActionDispatchContext(
+          actionRoutingKeys,
+          redirectCanonicalUrl,
+          nextUrl
+        )
         // TODO: Store the dynamic stale time on the top-level state so it's
         // known during restores and refreshes.
         const redirectSeed = convertServerPatchToFullTree(
@@ -485,7 +514,7 @@ export function serverActionReducer(
         // Learn the route pattern so we can predict it for future navigations.
         const metadataVaryPath = redirectSeed.metadataVaryPath
         if (metadataVaryPath !== null) {
-          discoverKnownRoute(
+          const fulfilledRoute = discoverKnownRoute(
             now,
             redirectUrl.pathname,
             redirectUrl.search as NormalizedSearch,
@@ -498,6 +527,7 @@ export function serverActionReducer(
             isPrerender,
             false // hasDynamicRewrite
           )
+          fulfilledRoute.actionRoutingKeys = actionRoutingKeys ?? null
         }
         const navigationLock = getCurrentNavigationLock()
 

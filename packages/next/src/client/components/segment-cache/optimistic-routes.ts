@@ -685,6 +685,7 @@ export function matchKnownRoute(
     tree: reifiedTree,
     metadata: reifiedMetadata,
     couldBeIntercepted: pattern.couldBeIntercepted,
+    actionRoutingKeys: pattern.actionRoutingKeys,
     supportsPerSegmentPrefetching: pattern.supportsPerSegmentPrefetching,
     hasDynamicRewrite: false,
     renderedSearch: search,
